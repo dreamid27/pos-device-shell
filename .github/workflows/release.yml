@@ -1,0 +1,174 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Cancel any in-flight build for the same ref. Useful when retagging.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: ""
+            args: ""
+          - platform: windows-latest
+            target: ""
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libudev-dev \
+            patchelf
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun store
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      # Caches ~/.cargo/registry, ~/.cargo/git, target/. Saves several minutes
+      # on subsequent runs.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # Bump this when forcing a clean cache.
+          prefix-key: v1
+
+      # Caches Tauri's downloaded helpers — WiX (~30MB on Win), NSIS (~7MB on
+      # Win), linuxdeploy + AppImage tooling (~50MB on Linux). Otherwise these
+      # download on every run.
+      - name: Cache Tauri helpers (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/tauri
+            src-tauri/target/release/bundle/appimage/*-deploy*
+            src-tauri/target/release/bundle/appimage/AppRun-*
+          key: ${{ runner.os }}-tauri-helpers-v1
+
+      - name: Cache Tauri helpers (Windows)
+        if: matrix.platform == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\tauri
+            src-tauri\target\release\wix
+            src-tauri\target\release\nsis
+          key: ${{ runner.os }}-tauri-helpers-v1
+
+      - name: Install JS deps
+        run: bun install --frozen-lockfile
+
+      - name: Build & upload via tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # sccache speeds up release-mode rebuilds when source changed but
+          # most crates haven't.
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "POS Device Shell ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG for changes."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: sccache stats
+        run: sccache --show-stats || true
+
+  publish-latest-json:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+
+          mkdir -p sigs
+          gh release download "$TAG" -R "${{ github.repository }}" --pattern '*.sig' --dir sigs
+          ls sigs/
+
+          read_sig() { cat "sigs/$1" 2>/dev/null || echo ""; }
+
+          base="https://github.com/${{ github.repository }}/releases/download/$TAG"
+
+          linux_sig=$(read_sig "POS.Device.Shell_${version}_amd64.AppImage.sig")
+          windows_sig=$(read_sig "POS.Device.Shell_${version}_x64-setup.exe.sig")
+
+          if [ -z "$linux_sig" ] || [ -z "$windows_sig" ]; then
+            echo "::error::missing signature(s) — linux=${#linux_sig}b windows=${#windows_sig}b"
+            exit 1
+          fi
+
+          cat > latest.json <<EOF
+          {
+            "version": "$version",
+            "notes": "See release notes on GitHub.",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "linux-x86_64": {
+                "url": "$base/POS%20Device%20Shell_${version}_amd64.AppImage",
+                "signature": "$linux_sig"
+              },
+              "windows-x86_64": {
+                "url": "$base/POS%20Device%20Shell_${version}_x64-setup.exe",
+                "signature": "$windows_sig"
+              }
+            }
+          }
+          EOF
+
+          gh release upload "$TAG" latest.json -R "${{ github.repository }}" --clobber
